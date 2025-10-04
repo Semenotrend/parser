@@ -9,6 +9,7 @@
 # - Канонизация тегов: format/tonality/patterns/ad_fit/audience/channel_topic
 # - Таксономии (2-й уровень): cinema/*, auto/*, travel/*, psychology/*, e_commerce/*, music.genres
 # - Запись taxonomy.* как дополнительные строки TSV (не ломая существующую схему)
+# - вы
 
 import os
 import re
