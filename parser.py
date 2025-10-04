@@ -610,59 +610,8 @@ def process_channels(cfg):
                 posts_texts = [m.text for m in base_msgs[-cfg["AI_POSTS_LIMIT"]:]] if base_msgs else []
                 posts_text_joined = "\n\n".join(posts_texts) if posts_texts else ""
 
-                # brand_mentions: «1 пост → 1 бренд»
-                seen_b, bm_one_per_post = set(), []
-                for m in base_msgs[-cfg["AI_POSTS_LIMIT"]:]:
-                    b = pick_one_brand(m.text or "")
-                    if not b: continue
-                    bl = _norm_lower(b)
-                    if bl in seen_b: continue
-                    seen_b.add(bl); bm_one_per_post.append(b)
-
-                # BIO — 1 кандидат
-                desc_b = pick_one_brand(description or "")
-                if desc_b and _norm_lower(desc_b) not in seen_b:
-                    seen_b.add(_norm_lower(desc_b)); bm_one_per_post.append(desc_b)
-
                 # AI анализ (format..topic..geo + brand_candidates)
                 ai = ai_analyze(title, description, posts_text_joined, openai_api_key, AI_MODEL) if (title or description or posts_text_joined) else {}
-
-                # AI brand_candidates → валидация по присутствию в тексте и фильтрам
-                ai_bm_valid = []
-                try:
-                    ai_bm_raw = ai.get("brand_candidates", {}).get("list", []) if isinstance(ai, dict) else []
-                    if isinstance(ai_bm_raw, list):
-                        corpus_low = _norm_lower(title + "\n" + description + "\n" + posts_text_joined)
-                        for b in ai_bm_raw:
-                            k = (str(b) or "").strip()
-                            if not k: continue
-                            if not is_probable_brand(k): continue
-                            kl = _norm_lower(k)
-                            if (kl in corpus_low) or (kl.replace(" ", "") in corpus_low):
-                                ai_bm_valid.append(k)
-                except Exception:
-                    pass
-
-                # Частотная добивка правилами (со строгой фильтрацией)
-                rule_pool = []
-                for t_ in [description] + posts_texts:
-                    rule_pool += brand_candidates_from_text(t_)
-                rule_pool = [x for x in rule_pool if is_probable_brand(x)]
-                freq = Counter(rule_pool)
-                ordered_rules = [b for b,_ in freq.most_common(400)]
-
-                # Сборка итога до 30–40
-                bm_final, seen_final = [], set()
-                for src in [bm_one_per_post, ai_bm_valid, ordered_rules]:
-                    for k in src:
-                        if not is_probable_brand(k): continue
-                        kl = _norm_lower(k)
-                        if kl in seen_final: continue
-                        seen_final.add(kl); bm_final.append(k)
-                        if len(bm_final) >= 40: break
-                    if len(bm_final) >= 40: break
-                bm_final = [b for b in bm_final if not (has_cyrillic(b) and not has_latin(b) and len(_norm_lower(b)) <= 3)]
-                brand_mentions_content = ", ".join(bm_final[:40]) if bm_final else "—"
 
                 # теги из AI
                 def _get(ai_obj, key):
@@ -779,7 +728,6 @@ def process_channels(cfg):
                     ("tonality",        tonality_c),
                     ("patterns",        patterns_c),
                     ("ad_fit",          ad_fit_c),
-                    ("brand_mentions",  brand_mentions_content),
                     ("audience",        audience_c),
                     ("channel_summary", summary_c),
                     ("channel_topic",   topic_c),
