@@ -1,6 +1,5 @@
 # parser.py — single-account (.env), TSV-чанки по 1000 строк.
 # Колонки как в ТЗ, теги без "semantics".
-# brand_mentions: жёсткий анти-мусор фильтр + «1 пост → 1 бренд» + AI brand_candidates + частотная добивка до 30–40.
 # link_out_ratio_72h, reposts_72h, posting_* (включая posting_median_interval_min) и контент-микс, geo_city_guess через AI,
 # normalize_patterns и enforce_topic_three_words.
 #
@@ -19,8 +18,6 @@ import logging
 import csv
 import json
 import glob
-import unicodedata
-from collections import Counter
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv, find_dotenv
 from telethon.sync import TelegramClient
@@ -319,98 +316,6 @@ def compute_posting_cadence_components(messages):
     top_hour = max(set(hours), key=hours.count) if hours else None
     peak_window = f"{top_hour:02d}:00–{(top_hour+1)%24:02d}:00" if top_hour is not None else "—"
     return posts_per_day, median_interval_min, stability, peak_window
-
-# ---------------------- BRAND MENTIONS PIPELINE ----------------------
-
-RU_COMMON = {
-    "думай","сделать","новый","новое","новая","осенний","осенью","пятница","пятничный","субботнее","субботний","все","звездочки",
-    "девушка","девушки","девочка","девочки","ленинградской","звуку","звук","дизайн","стили","обертонное","гудельная","напоминаю",
-    "отмечаем","пару","ходил","твой","твоей","твоего","твоих","венеции","голосистое","искристая","танцполье","хедлайнер"
-}
-RU_ADJ_SUFFIX = ("ый","ий","ая","ое","ые","ие","ому","ими","его","ового","ему","ими","ыми","ому","ему","ими","ым","ыме","ыми")
-RU_VERB_SUFFIX = ("ать","ять","ить","еть","нуть","ться","ться","ете","ем","ешь","ете","ут","ют","ёт","ешься","емся","етеся","итесь")
-PROFANITY = {"penis","fuck","shit","хуй","пизд","еба","сука"}
-WHITELIST_SHORT = {"vk","dfm","mtv","bbc","rt","rbk","yandex","vkfest"}
-GENERIC_HASHTAGS = {"осень","осенью","пятница","суббота","воскресенье","вечеринка","вечеринки","музыка","фестиваль","афиша"}
-
-def _norm_lower(s: str) -> str:
-    s = (s or "").lower()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s
-
-def has_cyrillic(s: str) -> bool:
-    return bool(re.search(r'[А-Яа-яЁё]', s or ""))
-
-def has_latin(s: str) -> bool:
-    return bool(re.search(r'[A-Za-z]', s or ""))
-
-def usernames_from_text(text):
-    return [u.lstrip('@') for u in re.findall(r'@([A-Za-z0-9_]{4,})', text or "")]
-
-def domains_from_text(text):
-    hosts = re.findall(r"https?://([^/\s]+)", text or "", flags=re.IGNORECASE)
-    brands = []
-    for h in hosts:
-        parts = h.split('.')
-        if len(parts) >= 2:
-            sld = parts[-2]
-            if sld and sld not in {"com","ru","org","net","io","gg","tv","me","ai","dev","info"}:
-                brands.append(sld)
-    return brands
-
-def is_probable_brand(tok: str) -> bool:
-    if not tok: return False
-    t = _norm_lower(tok)
-    if any(p in t for p in PROFANITY):  # профанация
-        return False
-    TECH_STOP = {"http","https","www","t","me","tme","telegram","tg","com","ru","org","net","io","ai","gg","tv","utm","ref","id"}
-    if t in TECH_STOP:
-        return False
-    if t in RU_COMMON:
-        return False
-    if has_cyrillic(tok) and not has_latin(tok):
-        if len(t) <= 3:
-            return False
-        if t.endswith(RU_ADJ_SUFFIX) or t.endswith(RU_VERB_SUFFIX):
-            return False
-        if tok.isalpha() and not tok.isupper():
-            return False
-    if t in GENERIC_HASHTAGS:
-        return False
-    if has_latin(tok) and len(t) < 3 and t not in WHITELIST_SHORT:
-        return False
-    return True
-
-def capitalized_spans(text):
-    spans = re.findall(r"\b([A-ZА-ЯЁ][A-Za-zА-Яа-яЁё0-9\-]{2,20}(?:\s+[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё0-9\-]{2,20}){0,2})\b", text or "")
-    out = []
-    for s in spans:
-        s_clean = s.strip()
-        if is_probable_brand(s_clean):
-            out.append(s_clean)
-    return out
-
-def hashtags_from_text(text):
-    return [h.lstrip('#') for h in re.findall(r"#([A-Za-zА-Яа-яЁё0-9_]{3,30})", text or "")]
-
-def brand_candidates_from_text(text: str):
-    cands = []
-    # приоритет: @username → домен → капс-фраза → хэштег
-    for u in usernames_from_text(text):
-        if is_probable_brand(u): cands.append(u)
-    for d in domains_from_text(text):
-        if is_probable_brand(d): cands.append(d)
-    for c in capitalized_spans(text):
-        if is_probable_brand(c): cands.append(c)
-    for tg in hashtags_from_text(text):
-        if is_probable_brand(tg): cands.append(tg)
-    return cands
-
-def pick_one_brand(text: str):
-    for cand in brand_candidates_from_text(text):
-        return cand
-    return None
 
 # === ДОП. нормализация под таксономии (ДОБАВЛЕНО) ===
 def _norm_for_taxonomy(text: str, cfg: dict) -> list:
