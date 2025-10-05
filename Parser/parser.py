@@ -18,6 +18,8 @@ import logging
 import csv
 import json
 import glob
+import sys
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv, find_dotenv
 from telethon.sync import TelegramClient
@@ -27,6 +29,23 @@ from socks import SOCKS5
 from urllib.parse import urlparse
 from statistics import median
 from openai import OpenAI
+
+LOG_DIR = "Logs"
+DATA_DIR = "Data"
+RAW_DIR = os.path.join(DATA_DIR, "raw")
+PROCESSED_DIR = os.path.join(LOG_DIR, "processed")
+LOG_PARSER_DIR = os.path.join(LOG_DIR, "parser")
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+BASE_DIR = SCRIPT_DIR.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(RAW_DIR, exist_ok=True)
+os.makedirs(PROCESSED_DIR, exist_ok=True)
+os.makedirs(LOG_PARSER_DIR, exist_ok=True)
 
 # === ОНТОЛОГИЯ: импорт хелпера (ДОБАВЛЕНО) ===
 from semantic_canonicalizer_snippet import (
@@ -39,16 +58,37 @@ from semantic_canonicalizer_snippet import (
 
 def load_env():
     env_path = os.getenv("ENV_FILE")
-    if env_path and os.path.exists(env_path):
-        load_dotenv(env_path, override=True)
+
+    candidates = []
+    if env_path:
+        env_candidate = Path(env_path)
+        if env_candidate.is_absolute():
+            candidates.append(env_candidate)
+        else:
+            candidates.append(Path.cwd() / env_candidate)
+            candidates.append(SCRIPT_DIR / env_candidate)
     else:
-        load_dotenv(find_dotenv(usecwd=True), override=True)
+        candidates.append(SCRIPT_DIR / ".env")
+        found = find_dotenv(usecwd=True)
+        if found:
+            candidates.append(Path(found))
+
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            load_dotenv(candidate, override=True)
+            break
+    else:
+        found = find_dotenv(usecwd=True)
+        if found:
+            load_dotenv(found, override=True)
 
     session = os.getenv("TELEGRAM_SESSION") or os.getenv("SESSION")
     api_id = os.getenv("TELEGRAM_API_ID") or os.getenv("API_ID")
     api_hash = os.getenv("TELEGRAM_API_HASH") or os.getenv("API_HASH")
     if not session or not api_id or not api_hash:
         raise RuntimeError("TELEGRAM_SESSION / TELEGRAM_API_ID / TELEGRAM_API_HASH не заданы в .env")
+
+    session_path = str((SCRIPT_DIR / session).resolve())
 
     proxy_enabled = os.getenv("PROXY_ENABLED", "0").strip() in ("1","true","True")
     proxy = None
@@ -62,6 +102,7 @@ def load_env():
 
     return {
         "session": session,
+        "session_path": session_path,
         "api_id": int(api_id),
         "api_hash": api_hash,
         "proxy": proxy,
@@ -77,8 +118,20 @@ def load_env():
         "SEMANTIC_ONTOLOGY_PATH": os.getenv("SEMANTIC_ONTOLOGY_PATH", "semantic_ontology_v2_1.json"),
     }
 
-logging.basicConfig(filename='parser.log', level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+def configure_logging(session_name: str) -> str:
+    log_path = os.path.join(LOG_PARSER_DIR, f"{session_name}.log")
+    root_logger = logging.getLogger()
+    if root_logger.handlers:
+        for handler in list(root_logger.handlers):
+            root_logger.removeHandler(handler)
+    logging.basicConfig(
+        filename=log_path,
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+    return log_path
+
 
 SLEEP_MIN, SLEEP_MAX = 3, 7
 RESOLVE_BACKOFFS = [5, 15, 45]
@@ -337,6 +390,12 @@ def _norm_for_taxonomy(text: str, cfg: dict) -> list:
 
 # ---------------------- TSV CHUNK MANAGEMENT ----------------------
 
+def ensure_parent_dir(path: str) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+
 def chunk_filename(base: str, session: str, idx: int, pad: int) -> str:
     return f"{base}_{session}_{str(idx).zfill(pad)}.tsv"
 
@@ -354,6 +413,7 @@ def init_chunk_state(output_base, session, fieldnames, chunk_size, pad):
     if not files:
         idx = 1
         path = chunk_filename(output_base, session, idx, pad)
+        ensure_parent_dir(path)
         with open(path, "w", encoding="utf-8", newline='') as tsvfile:
             writer = csv.DictWriter(tsvfile, fieldnames=fieldnames, delimiter='\t')
             writer.writeheader()
@@ -371,6 +431,7 @@ def rotate_if_needed(state, output_base, session, fieldnames):
         state['index'] += 1
         state['rows'] = 0
         path = chunk_filename(output_base, session, state['index'], state['pad'])
+        ensure_parent_dir(path)
         with open(path, "w", encoding="utf-8", newline='') as tsvfile:
             writer = csv.DictWriter(tsvfile, fieldnames=fieldnames, delimiter='\t')
             writer.writeheader()
@@ -379,6 +440,7 @@ def write_row_chunked(row: dict, state, output_base, session, fieldnames):
     if state['rows'] >= state['chunk_size']:
         rotate_if_needed(state, output_base, session, fieldnames)
     path = chunk_filename(output_base, session, state['index'], state['pad'])
+    ensure_parent_dir(path)
     with open(path, "a", encoding="utf-8", newline='') as tsvfile:
         writer = csv.DictWriter(tsvfile, fieldnames=fieldnames, delimiter='\t')
         writer.writerow(row)
@@ -387,18 +449,28 @@ def write_row_chunked(row: dict, state, output_base, session, fieldnames):
 # ---------------------- CORE ----------------------
 
 def process_channels(cfg):
-    session = cfg["session"]; api_id = cfg["api_id"]; api_hash = cfg["api_hash"]
-    proxy = cfg["proxy"]; openai_api_key = cfg["openai_key"]
-    MSG_LIMIT = cfg["MSG_LIMIT"]; CHANNELS_FILE = cfg["CHANNELS_FILE"]
-    OUTPUT_BASE = cfg["OUTPUT_BASE"]; CHUNK_SIZE = cfg["CHUNK_SIZE"]; CHUNK_PAD = cfg["CHUNK_PAD"]
-    AI_MODEL = cfg["AI_MODEL"]; AI_POSTS_LIMIT = cfg["AI_POSTS_LIMIT"]
+    session_name = cfg["session"]
+    session_path = cfg.get("session_path", session_name)
+    api_id = cfg["api_id"]
+    api_hash = cfg["api_hash"]
+    proxy = cfg["proxy"]
+    openai_api_key = cfg["openai_key"]
+    MSG_LIMIT = cfg["MSG_LIMIT"]
+    CHANNELS_FILE = cfg["CHANNELS_FILE"]
+    OUTPUT_BASE = cfg["OUTPUT_BASE"]
+    CHUNK_SIZE = cfg["CHUNK_SIZE"]
+    CHUNK_PAD = cfg["CHUNK_PAD"]
+    AI_MODEL = cfg["AI_MODEL"]
+    AI_POSTS_LIMIT = cfg["AI_POSTS_LIMIT"]
+
+    output_base_path = os.path.join(RAW_DIR, OUTPUT_BASE)
 
     # === Загрузка онтологии (ДОБАВЛЕНО) ===
     ontology_path = cfg.get("SEMANTIC_ONTOLOGY_PATH", "semantic_ontology_v2_1.json")
     ontology = load_ontology(ontology_path) or {}
     norm_cfg = ontology.get("normalization", {})
 
-    processed_file = f"processed_{session}.txt"
+    processed_file = os.path.join(PROCESSED_DIR, f"processed_{session_name}.txt")
 
     fieldnames = [
         "row_id","title","username","contacts","emails","links","subscribers",
@@ -411,7 +483,7 @@ def process_channels(cfg):
         "tag","content","account"
     ]
 
-    chunk_state = init_chunk_state(OUTPUT_BASE, session, fieldnames, CHUNK_SIZE, CHUNK_PAD)
+    chunk_state = init_chunk_state(output_base_path, session_name, fieldnames, CHUNK_SIZE, CHUNK_PAD)
 
     processed_map = {}
     if os.path.exists(processed_file):
@@ -426,19 +498,19 @@ def process_channels(cfg):
     # connect
     try:
         client = TelegramClient(
-            session, api_id, api_hash, proxy=proxy,
+            session_path, api_id, api_hash, proxy=proxy,
             device_model='Samsung SM-G996B', system_version='Android 13',
             app_version='10.3.1', lang_code='ru', system_lang_code='ru-RU'
         )
         client.connect()
     except Exception as e:
-        logging.error(f"[connect] {session} error: {e}")
-        print(f"[✖] fatal connect for {session}: {e}")
+        logging.error(f"[connect] {session_name} error: {e}")
+        print(f"[X] fatal connect for {session_name}: {e}")
         return
 
     if not client.is_user_authorized():
-        logging.error(f"[auth] {session} not authorized.")
-        print(f"[⚠] {session} не авторизован — завершение.")
+        logging.error(f"[auth] {session_name} not authorized.")
+        print(f"[!] {session_name} не авторизован - завершение.")
         client.disconnect(); return
 
     from telethon.errors.rpcerrorlist import ChannelPrivateError
@@ -598,7 +670,7 @@ def process_channels(cfg):
                 # RAW BIO
                 bio_raw_content = description or ""
 
-                base_row_id = f"{session}-{index+1}"
+                base_row_id = f"{session_name}-{index+1}"
                 common_cols = {
                     "title": title,
                     "username": username,
@@ -625,7 +697,7 @@ def process_channels(cfg):
                     "geo_city_guess_country": geo_country,
                     "geo_city_guess_confidence": round(geo_conf, 2),
                     "chat_discussion": str(chat_discussion).lower(),
-                    "account": session
+                    "account": session_name
                 }
 
                 rows = [
@@ -669,13 +741,13 @@ def process_channels(cfg):
                 # --- запись TSV ---
                 for seq, (tag, content) in enumerate(rows, start=1):
                     row = {"row_id": f"{base_row_id}-{seq}", "tag": tag, "content": (content or "").strip(), **common_cols}
-                    write_row_chunked(row, chunk_state, OUTPUT_BASE, session, fieldnames)
+                    write_row_chunked(row, chunk_state, output_base_path, session_name, fieldnames)
 
                 processed_map[channel_key] = True
                 with open(processed_file, "a", encoding="utf-8") as pf:
                     pf.write(f"{channel_key}\n")
 
-                print(f"[✔] {session} обработал: {title}")
+                print(f"[OK] {session_name} обработал: {title}")
 
             except ChannelPrivateError:
                 with open(processed_file, "a", encoding="utf-8") as pf: pf.write(f"{(link or '').lower()}\n")
@@ -687,8 +759,8 @@ def process_channels(cfg):
                 logging.warning(f"[rpc] {link}: {e.__class__.__name__}")
                 with open(processed_file, "a", encoding="utf-8") as pf: pf.write(f"{(link or '').lower()}\n")
             except Exception as e:
-                logging.error(f"[loop] Ошибка {session} с {link}: {e}")
-                print(f"[⚠] Ошибка {session} с {link}: {e}")
+                logging.error(f"[loop] Ошибка {session_name} с {link}: {e}")
+                print(f"[!] Ошибка {session_name} с {link}: {e}")
 
     finally:
         try: client.disconnect()
@@ -698,6 +770,7 @@ def process_channels(cfg):
 
 def main():
     cfg = load_env()
+    configure_logging(cfg["session"])
     process_channels(cfg)
 
 if __name__ == "__main__":
