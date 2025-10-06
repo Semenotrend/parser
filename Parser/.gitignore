@@ -1,7 +1,0 @@
-.env
-*.session
-parser.log
-processed_*.txt
-channels_analysis_*
-__pycache__/
-
